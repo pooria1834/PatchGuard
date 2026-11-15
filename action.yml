@@ -1,0 +1,32 @@
+name: 'PatchGuard security patch gate'
+description: 'Reject unverified, incomplete or functionally regressive C/C++ patches'
+inputs:
+  config:
+    description: 'Target YAML path, relative to the consumer repository root'
+    required: true
+  patched:
+    description: 'Optional candidate source path, relative to consumer repository root'
+    required: false
+    default: ''
+  report-dir:
+    description: 'Where to save summary.md, verdict.json and all evidence'
+    required: false
+    default: artifacts/patchguard
+outputs:
+  exit_code:
+    description: 'PatchGuard documented verdict code (0, 10, 20, 30, 40)'
+    value: ${{ steps.gate.outputs.exit_code }}
+  report_dir:
+    description: 'Relative location of the report in the consumer repo'
+    value: ${{ steps.gate.outputs.report_dir }}
+runs:
+  using: composite
+  steps:
+    - id: gate
+      name: 'Validate patch (blocking, isolated)'
+      shell: bash
+      env:
+        PG_CONFIG: ${{ inputs.config }}
+        PG_PATCHED: ${{ inputs.patched }}
+        PG_REPORT_DIR: ${{ inputs.report-dir }}
+      run: "$GITHUB_ACTION_PATH/scripts/github_gate.sh"

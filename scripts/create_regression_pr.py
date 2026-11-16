@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -44,6 +45,27 @@ def api(url: str, token: str, payload: dict) -> dict:
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f'GitHub PR API returned HTTP {exc.code}: '
                            + exc.read(2000).decode('utf-8', 'replace')) from exc
+
+
+def existing_draft(repository: str, branch: str, token: str) -> str | None:
+    """Support reruns without duplicating an existing open PR."""
+    owner = repository.split('/', 1)[0]
+    query = urllib.parse.urlencode({'state': 'open', 'head': f'{owner}:{branch}', 'per_page': 10})
+    request = urllib.request.Request(
+        f'https://api.github.com/repos/{repository}/pulls?{query}',
+        headers={'Authorization': 'Bearer ' + token,
+                 'Accept': 'application/vnd.github+json',
+                 'X-GitHub-Api-Version': '2022-11-28'})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        matches = json.load(response)
+    if not isinstance(matches, list):
+        raise RuntimeError('GitHub did not return a PR list')
+    for match in matches:
+        if match.get('head', {}).get('ref') == branch:
+            url = match.get('html_url')
+            if isinstance(url, str) and url.startswith('https://github.com/'):
+                return url
+    return None
 
 
 def main(argv=None) -> int:
@@ -92,23 +114,29 @@ def main(argv=None) -> int:
     current_ref = os.environ.get('GITHUB_REF', '')
     repository = os.environ.get('GITHUB_REPOSITORY', '')
     token = os.environ.get('PG_GITHUB_TOKEN', '')
-    if not args.dry_run and (event not in ('push', 'workflow_dispatch')
+    if not args.dry_run and (event != 'workflow_run'
                              or not default or current_ref != 'refs/heads/' + default):
-        print('Automatic PR skipped: only trusted default-branch pushes/dispatches may create a write PR.')
-        note('skipped on untrusted/non-default-branch event; review the evidence artifact.')
+        print('Automatic PR skipped: only the trusted workflow_run publisher may create a write PR.')
+        note('skipped outside trusted workflow_run default-branch event.')
         return 0
     if not args.dry_run and (not token or not re.fullmatch(r'[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+', repository)):
-        print('Automatic PR skipped: GitHub token/repository is unavailable.')
-        note('skipped; GitHub token or repository permission is missing.')
-        return 0
-    number = os.environ.get('GITHUB_RUN_ID', 'local')
-    attempt = os.environ.get('GITHUB_RUN_ATTEMPT', '1')
+        raise RuntimeError('publisher lacks GitHub token or repository identity')
+    number = os.environ.get('PG_SOURCE_RUN_ID') or os.environ.get('GITHUB_RUN_ID', 'local')
+    attempt = os.environ.get('PG_SOURCE_RUN_ATTEMPT') or os.environ.get('GITHUB_RUN_ATTEMPT', '1')
     if not re.fullmatch(r'[0-9]+', number) or not re.fullmatch(r'[0-9]+', attempt):
         if not args.dry_run:
             parser.error('invalid GitHub run number')
         number, attempt = '0', '1'
     branch = f'patchguard/regressions-{number}-{attempt}'
     result_path = folder / 'regression-pr.json'
+    if not args.dry_run:
+        url = existing_draft(repository, branch, token)
+        if url:
+            print('An existing draft PR already covers this source run:', url)
+            result_path.write_text(json.dumps({'branch': branch, 'url': url,
+                                               'cases': case_ids, 'existing': True}, indent=2) + '\n')
+            note(f'existing draft PR: {url} (no duplicate proposal created).')
+            return 0
     with tempfile.TemporaryDirectory(prefix='patchguard-pr-') as temporary:
         worktree = Path(temporary) / 'checkout'
         git(root, 'worktree', 'add', '--detach', str(worktree), 'HEAD')

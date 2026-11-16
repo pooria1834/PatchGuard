@@ -21,6 +21,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     parser.add_argument('--report-dir', required=True)
+    parser.add_argument('--verify-witness', action='store_true',
+                        help='Rebuild the exact Git-sourced witness and reproduce its signature three times')
     args = parser.parse_args(argv)
     try:
         folder = workspace_path(args.report_dir, 'report directory', within=ROOT / 'artifacts')
@@ -89,7 +91,7 @@ def main(argv=None) -> int:
                 # three identical replay signatures, and independent oracle.
                 # The three Base/Candidate replays have already happened in CI;
                 # avoid rebuilding the target once per candidate.
-                result = promote_archive(args.config, str(archive), case_id, verify_base=False)
+                result = promote_archive(args.config, str(archive), case_id, verify_base=args.verify_witness)
                 (existing if result.get('deduplicated') else added).append(case_id)
             except (ConfigError, ValueError, OSError, KeyError, TypeError) as exc:
                 rejected.append(dict(id=case_id, reason=str(exc)))
@@ -124,7 +126,9 @@ def main(argv=None) -> int:
               f'{len(skipped_modes)} equivalent build-mode duplicates, {len(rejected)} rejected')
         for item in rejected:
             print(f"Rejected {item['id']}: {item['reason']}", file=sys.stderr)
-        return 0 if not rejected else 40
+        # A rejected witness is explicitly listed in the plan but does not
+        # prevent publishing other independently verified, unique cases.
+        return 0
     except (ConfigError, ValueError, OSError, KeyError, TypeError) as exc:
         print(f'PR preparation blocked: {exc}', file=sys.stderr)
         return 30

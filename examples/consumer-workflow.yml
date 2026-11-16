@@ -7,8 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   validate-patch:
@@ -26,8 +25,9 @@ jobs:
         with:
           config: configs/target.yaml
           report-dir: artifacts/patchguard
-          auto-regression-pr: 'true'
-          github-token: ${{ github.token }}
+          auto-regression-pr: 'false'
+          # Add a separate workflow_run subscriber to open review PRs.
+          # See examples/record-parser/patchguard-regression-pr.yml
       - name: Upload PatchGuard evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4

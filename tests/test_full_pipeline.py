@@ -87,12 +87,33 @@ sys.stdout.buffer.write(b"ERR\\n" if b"bad" in content else
     packed = command(str(TOOL/'scripts/package_ci_evidence.py'), '--report-dir', 'artifacts/ci')
     assert packed.returncode == 0, packed.stderr
     staged = command(str(TOOL/'scripts/batch_promote.py'), '--config', 'config.yaml',
-                     '--report-dir', 'artifacts/ci')
+                     '--report-dir', 'artifacts/ci', '--verify-witness')
     assert staged.returncode == 0, staged.stderr
     plan = json.loads((folder/'regression-pr-preparation.json').read_text())
     assert len(plan['added']) == 1
     assert len(plan['redundant_build_modes']) == 1
     assert not plan['rejected']
+    # Emulate unprivileged verify -> privileged publish using canonical data-only handoff.
+    handoff = tmp_path/'handoff'
+    exported = command(str(TOOL/'scripts/export_verified_regressions.py'),
+                       '--config', 'config.yaml', '--archive', 'artifacts/ci/technical-evidence.zip',
+                       '--plan', 'artifacts/ci/regression-pr-preparation.json',
+                       '--out', str(handoff), '--run-id', '123', '--run-attempt', '1')
+    assert exported.returncode == 0, exported.stderr
+    assert json.loads((handoff/'plan.json').read_text())['added'] == plan['added']
+    shutil.rmtree(tmp_path/'tests/regression/reviewed/smoke')
+    imported = command(str(TOOL/'scripts/import_verified_regressions.py'),
+                       '--config', 'config.yaml', '--handoff', str(handoff),
+                       '--report-dir', 'artifacts/ci', '--source-run-id', '123', '--source-run-attempt', '1')
+    assert imported.returncode == 0, imported.stderr
+    assert json.loads((folder/'regression-pr-preparation.json').read_text())['added'] == plan['added']
+    # A tampered handoff is rejected rather than silently imported.
+    blob = next((handoff/'reviewed').glob('*.bin'))
+    blob.write_bytes(b'bad tamper')
+    bad = command(str(TOOL/'scripts/import_verified_regressions.py'),
+                  '--config', 'config.yaml', '--handoff', str(handoff),
+                  '--report-dir', 'artifacts/ci', '--source-run-id', '123', '--source-run-attempt', '1')
+    assert bad.returncode == 30
     dry_run = subprocess.run([sys.executable, str(TOOL/'scripts/create_regression_pr.py'),
                               '--report-dir', 'artifacts/ci', '--dry-run'], cwd=tmp_path,
                              env=dict(env, GITHUB_WORKSPACE=str(tmp_path)),

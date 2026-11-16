@@ -76,27 +76,20 @@ if [[ -f "$report/report.json" ]]; then
     python3 "$GITHUB_ACTION_PATH/scripts/package_ci_evidence.py" \
     --report-dir "$PG_REPORT_DIR" || echo 'WARNING: technical evidence packaging failed' >&2
 fi
-# The trusted host NEVER hands the GitHub write token to the evaluation
-# container. A separate, network-denied container validates and stages all
-# unique stable witnesses; host-side git then proposes one draft PR.
-if [[ "${PG_AUTO_REGRESSION_PR:-true}" == "true" && -f "$report/technical-evidence.zip" ]]; then
-  if docker run --rm \
-    --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-    --memory 2g --memory-swap 2g --cpus 2 --pids-limit 256 \
-    --tmpfs /tmp:rw,nosuid,noexec,size=256m \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/tmp -e PATCHGUARD_WORKSPACE=/work -e PYTHONPATH=/tool \
-    -v "$GITHUB_WORKSPACE:/work" "${git_metadata_mount[@]}" -v "$GITHUB_ACTION_PATH:/tool:ro" -w /work \
-    "$image" python3 /tool/scripts/batch_promote.py \
-      --config "$PG_CONFIG" --report-dir "$PG_REPORT_DIR"; then
-    echo 'Regression witnesses verified for PR proposal.'
-  else
-    echo 'WARNING: at least one generated witness could not be auto-promoted; inspect regression-pr-preparation.json.' >&2
-  fi
-  # This step uses only stdlib, git and GitHub REST. It never executes the
-  # target, replays arbitrary code, or publishes a PR without user review.
-  python3 "$GITHUB_ACTION_PATH/scripts/create_regression_pr.py" \
-    --report-dir "$PG_REPORT_DIR" || echo 'WARNING: could not create a GitHub regression PR' >&2
+# PR executions must remain read-only. A separate workflow_run workflow,
+# defined on the consumer repository default branch, revalidates the uploaded
+# evidence and publishes one draft PR. Do not promote or push here.
+if [[ -f "$report/report.json" && -f "$report/summary.md" ]]; then
+  cat >> "$report/summary.md" <<'EOF'
+
+## Automatic regression PR handoff
+
+The validator never creates a write-capable PR itself. After this run completes,
+**PatchGuard regression PR** (the separate `workflow_run` workflow, if installed
+on the default branch) independently verifies minimized witnesses and proposes
+one **draft PR against main**, even when this check returns exit 10 or 20.
+Look under Actions → PatchGuard regression PR for the PR URL or rejection reason.
+EOF
 fi
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   if [[ -f "$report/summary.md" ]]; then

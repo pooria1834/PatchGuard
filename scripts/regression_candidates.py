@@ -38,7 +38,7 @@ def main(argv=None):
             rows.setdefault(case_id, entry)
     lines = ["# Automatically proposed regression candidates", "",
              f"**{len(rows)} new stable Base/Candidate witness(es)** are available for review.", "",
-             "The trusted default-branch workflow combines all verified unique cases in ONE draft PR; "
+             "The trusted follow-up workflow_run job proposes ONE draft PR after verification; "
              "a maintainer must approve/merge it. Fork pull requests cannot exercise the write capability.", "",
              "| Generated case ID | Origin case | Side / mode | Bytes |", "| --- | --- | --- | ---: |"]
     for case_id, entry in sorted(rows.items())[:15]:
@@ -53,8 +53,8 @@ def main(argv=None):
         lines.append(f"\n…and {len(rows)-15} more in `report.json` → `replay`.")
     if not rows:
         lines.append("| *(no newly generated stable Base witnesses)* | – | – | – |")
-    lines.extend(["", "The automatic Action stage verifies all candidates, filters already-present fixtures, "
-                  "and opens a single draft GitHub PR on trusted default-branch runs when write permissions are granted.", ""])
+    lines.extend(["", "The separate workflow_run stage replays and verifies candidates, filters existing fixtures, "
+                  "and opens one draft PR against main when the privileged publisher has write permissions.", ""])
     (folder / "regression-candidates.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"Regression candidate index: {folder.relative_to(root) / 'regression-candidates.md'} ({len(rows)} candidates)")
 

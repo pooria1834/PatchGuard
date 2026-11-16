@@ -9,13 +9,13 @@ inputs:
     required: false
     default: ''
   auto-regression-pr:
-    description: 'Propose all unique stable minimized findings as one draft PR on trusted default-branch runs'
+    description: 'Legacy switch; the separate workflow_run job now creates regression PRs (this action never pushes)'
     required: false
-    default: 'true'
+    default: 'false'
   github-token:
-    description: 'Write-capable token for the review PR (permissions: contents:write, pull-requests:write)'
+    description: 'Deprecated; do not pass a write token to the validation action'
     required: false
-    default: ${{ github.token }}
+    default: ''
   report-dir:
     description: 'Where to save summary.md, verdict.json and all evidence'
     required: false
@@ -38,6 +38,5 @@ runs:
         PG_PATCHED: ${{ inputs.patched }}
         PG_REPORT_DIR: ${{ inputs.report-dir }}
         PG_AUTO_REGRESSION_PR: ${{ inputs.auto-regression-pr }}
-        PG_GITHUB_TOKEN: ${{ inputs.github-token }}
         PG_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       run: "$GITHUB_ACTION_PATH/scripts/github_gate.sh"

@@ -1,6 +1,10 @@
 """Collect descriptive compiler and ELF evidence."""
 
 from pathlib import Path
+import re
+
+# Bound stored ELF evidence without applying the small per-test output cap.
+SYMBOL_OUTPUT_LIMIT = 1024 * 1024
 
 from .config import ROOT
 from .run import execute
@@ -13,27 +17,43 @@ def collect(build: dict, directory: Path) -> dict:
     commands = {
         "readelf": ["readelf", "-W", "-h", "-l", "-d", str(binary)],
         "file": ["file", str(binary)],
-        "symbols": ["readelf", "-W", "-s", str(binary)],
     }
     for name, argv in commands.items():
         probe = execute(argv, directory / name, limit=65536)
-        result[name] = dict(status="available" if probe["returncode"] == 0 else "unavailable", process=probe)
+        result[name] = dict(status="available" if probe["returncode"] == 0 and not probe["stdout"]["truncated"] else "unavailable",
+                            process=probe)
+
+    # Dynamic symbols normally contain __stack_chk_fail for dynamically linked
+    # programs. If absent, consult the full table (including static symbols).
+    # Keep the selected evidence under symbols/ for existing report paths.
+    dynamic_probe = execute(["readelf", "-W", "--dyn-syms", str(binary)],
+                            directory / "symbols", limit=SYMBOL_OUTPUT_LIMIT)
+    dynamic_ok = dynamic_probe["returncode"] == 0 and not dynamic_probe["stdout"]["truncated"]
+    dynamic_text = ((ROOT / dynamic_probe["stdout"]["path"]).read_text(errors="replace")
+                    if dynamic_ok else "")
+    if dynamic_ok and re.search(r"\b__stack_chk_fail\b", dynamic_text):
+        selected, selected_text, source = dynamic_probe, dynamic_text, "dynamic"
+    else:
+        selected = execute(["readelf", "-W", "-s", str(binary)],
+                           directory / "symbols", limit=SYMBOL_OUTPUT_LIMIT)
+        selected_ok = selected["returncode"] == 0 and not selected["stdout"]["truncated"]
+        selected_text = ((ROOT / selected["stdout"]["path"]).read_text(errors="replace")
+                         if selected_ok else None)
+        source = "full"
+    result["symbols"] = dict(status="available" if selected_text is not None else "unavailable",
+                             source=source, process=selected)
     readelf = result["readelf"]["process"]
     rows = (ROOT / readelf["stdout"]["path"]).read_text(errors="replace").splitlines()
     interpreter = next((row.strip().removesuffix("]").split(": ", 1)[-1]
                         for row in rows if "[Requesting program interpreter:" in row), None)
-    symbols = result["symbols"]["process"]
     checks = hardening("\n".join(rows) if readelf["returncode"] == 0 and not readelf["stdout"]["truncated"] else "",
-                       (ROOT / symbols["stdout"]["path"]).read_text(errors="replace")
-                       if symbols["returncode"] == 0 and not symbols["stdout"]["truncated"] else None)
+                       selected_text)
     return dict(hardening=checks, elf=build["elf"], sha256=build["sha256"], flags=build["flags"],
                 compiler=build["compiler"], interpreter=interpreter, tools=result)
 
 
 def hardening(headers: str, symbols: str | None) -> dict:
     """Interpret ELF markers with the exact source lines used by each check."""
-    import re
-
     rows = headers.splitlines()
     stack = next((row for row in rows if row.lstrip().startswith("GNU_STACK ")), None)
     relro = next((row for row in rows if row.lstrip().startswith("GNU_RELRO ")), None)

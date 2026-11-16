@@ -19,7 +19,7 @@ NAMES = {0: "CORRECTED", 10: "INCOMPLETE_CORRECTION", 20: "FUNCTIONAL_REGRESSION
 
 def priority(*codes: int) -> int:
     """Select the strongest observed outcome."""
-    return next(code for code in (30, 10, 20, 40, 0) if code == 0 or code in codes)
+    return next(code for code in (40, 20, 10, 30, 0) if code == 0 or code in codes)
 
 
 def assess(cases: list[dict], records: list[dict]) -> dict:
@@ -71,6 +71,12 @@ def assess(cases: list[dict], records: list[dict]) -> dict:
 
     base_mismatches = []
     remaining, regressions, differences, fixed, new_issues = [], [], [], [], []
+    # Equal bytes with different CLI arguments are different logical tests.
+    import json
+    def invocation_key(case: dict) -> str:
+        invocation = json.dumps(case.get('effective_args', case.get('args', [])), separators=(',', ':'), ensure_ascii=True)
+        return sha256(case['input'] + b'\0' + invocation.encode('ascii')).hexdigest()
+
     rules = {}
     unexplained = False
     for case in cases:
@@ -78,7 +84,7 @@ def assess(cases: list[dict], records: list[dict]) -> dict:
         base = observations.get((name, "base"))
         if base and not base["match"] and case["kind"] in ("invalid", "boundary"):
             base_mismatches.append(name)
-            rules.setdefault(rule(base), set()).add(sha256(case["input"]).hexdigest())
+            rules.setdefault(rule(base), set()).add(invocation_key(case))
 
     for case in cases:
         name = case["id"]
@@ -93,7 +99,7 @@ def assess(cases: list[dict], records: list[dict]) -> dict:
             if name in base_mismatches:
                 fixed.append(name)
             continue
-        other = rules.get(rule(candidate), set()) - {sha256(case["input"]).hexdigest()}
+        other = rules.get(rule(candidate), set()) - {invocation_key(case)}
         if base and not base["match"] and case["kind"] in ("invalid", "boundary") and other and signature(candidate) == signature(base):
             remaining.append(name)
         elif case["kind"] == "valid" and base["match"]:

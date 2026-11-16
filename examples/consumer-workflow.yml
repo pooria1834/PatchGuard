@@ -1,0 +1,46 @@
+# Template: adapt paths, default branch and action ref before using.
+name: PatchGuard security patch validation
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Docker mounts the target checkout: do not persist GitHub tokens
+          # into .git/config where untrusted binaries could read them.
+          persist-credentials: false
+      # Replace your-org/PatchGuard@v1 with the correct trusted pinned action ref.
+      - name: Run PatchGuard and propose regression PR
+        id: patchguard
+        uses: your-org/PatchGuard@v1
+        with:
+          config: configs/target.yaml
+          report-dir: artifacts/patchguard
+          auto-regression-pr: 'true'
+          github-token: ${{ github.token }}
+      - name: Upload PatchGuard evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patchguard-pr-evidence
+          if-no-files-found: warn
+          path: |
+            artifacts/patchguard/summary.md
+            artifacts/patchguard/verdict.json
+            artifacts/patchguard/report.json
+            artifacts/patchguard/evidence-index.md
+            artifacts/patchguard/evidence-index.json
+            artifacts/patchguard/regression-candidates.md
+            artifacts/patchguard/regression-pr-preparation.json
+            artifacts/patchguard/regression-pr.json
+            artifacts/patchguard/technical-evidence.zip

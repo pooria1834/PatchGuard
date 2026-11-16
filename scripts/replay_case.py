@@ -49,7 +49,7 @@ def main() -> int:
             expected_exit = manifest["expected_exit"]
             expected_stdout = bytes.fromhex(manifest["expected_stdout"])
         case = dict(id=manifest["case_id"], input=data, expected_exit=expected_exit,
-                    expected_stdout=expected_stdout)
+                    expected_stdout=expected_stdout, args=manifest.get("args", manifest["configuration"]["resolved"]["run"].get("args", [])))
         run = run_case(build, case, manifest["configuration"]["resolved"]["run"], directory / "manual-replay")
         observed = signature(run | compare(case, run))
         print(json.dumps(dict(observed_signature=observed, expected_signature=manifest["signature"])))

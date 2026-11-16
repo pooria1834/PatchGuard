@@ -1,4 +1,4 @@
-"""Promote one reviewed Base regression into the tracked test corpus.
+"""Promote one reviewed regression into the tracked test corpus.
 
 For CI evidence, use --evidence-zip to validate archived replay records, an
 independent oracle, and (by default) rebuild and replay Base three times.
@@ -37,16 +37,17 @@ def main() -> int:
             generated = workspace_path(settings["dir"], "regression.dir")
             reviewed = workspace_path(settings["reviewed"], "regression.reviewed")
             run = config["run"]
-            cases = load_cases(generated / "manifest.yaml", run["max_input_bytes"], run["output_limit_bytes"])
+            cases = load_cases(generated / "manifest.yaml", run["max_input_bytes"], run["output_limit_bytes"], run=run)
             case = next((row for row in cases if row["id"] == args.case), None)
-            if not case or case.get("witness_role") != "base" or not case.get("preserved_signature"):
-                raise ConfigError("choose a generated Base witness from the local manifest")
+            if not case or case.get("witness_role") not in ("base", "candidate") or not case.get("preserved_signature"):
+                raise ConfigError("choose a generated witness from the local manifest")
             check_independent_oracle(config, case)
             if args.dry_run:
                 result = dict(id=case["id"], dry_run=True)
             else:
                 result = generate_case(reviewed, case, case["input"], case["preserved_signature"],
-                                       witness_role="base", witness_mode=case["witness_mode"])
+                                       witness_role=case["witness_role"], witness_mode=case["witness_mode"],
+                                       args=case.get("args", run.get("args", [])), case_id=case["id"])
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except (ConfigError, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, IndexError) as exc:

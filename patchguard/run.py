@@ -130,7 +130,8 @@ def run_case(build: dict, case: dict, settings: dict, directory: Path) -> dict:
         staged = workspace_path(directory / "staged" / "input.bin", "staged input", within=directory)
         staged.parent.mkdir(parents=True, exist_ok=True)
         staged.write_bytes(data)
-    for arg in settings.get("args", []):
+    # A case-level args list replaces, rather than appends to, the default.
+    for arg in case.get("args", settings.get("args", [])):
         if method == "file":
             argv.append(arg.replace("{input_file}", str(staged)))
         elif method == "argv":

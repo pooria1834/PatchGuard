@@ -1,4 +1,4 @@
-"""Create a small, reviewable index of Base regression candidates from a run."""
+"""List stable minimized Base and Candidate witnesses for the automatic review PR."""
 
 import argparse
 import json
@@ -31,16 +31,16 @@ def main(argv=None):
     for entry in report.get("replay", []):
         generated = entry.get("generated") or {}
         case_id = generated.get("id")
-        if (entry.get("role") == "base" and entry.get("stable") is True
+        if (entry.get("role") in ("base", "candidate") and entry.get("stable") is True
             and generated.get("manifest") == generated_manifest
             and isinstance(case_id, str) and case_id.startswith("generated-")
             and case_id not in reviewed_ids):
             rows.setdefault(case_id, entry)
-    lines = ["# Suggested security regression cases", "",
-             f"**{len(rows)} stable Base case(s)** are available for manual review.", "",
-             "These are **candidates**, not automatically approved tests. Review the replay, "
-             "independent oracle, and input before promoting one into the tracked corpus.", "",
-             "| Generated case ID | Origin case | Mode | Bytes |", "| --- | --- | --- | ---: |"]
+    lines = ["# Automatically proposed regression candidates", "",
+             f"**{len(rows)} new stable Base/Candidate witness(es)** are available for review.", "",
+             "The trusted default-branch workflow combines all verified unique cases in ONE draft PR; "
+             "a maintainer must approve/merge it. Fork pull requests cannot exercise the write capability.", "",
+             "| Generated case ID | Origin case | Side / mode | Bytes |", "| --- | --- | --- | ---: |"]
     for case_id, entry in sorted(rows.items())[:15]:
         name = entry.get("minimized")
         path = (root / name).resolve() if isinstance(name, str) else None
@@ -48,14 +48,13 @@ def main(argv=None):
         # Case IDs are sanitized by config validation; keep Markdown safe anyway.
         case_id = case_id.replace("|", "")
         lines.append(f"| `{case_id}` | `{str(entry.get('case_id', 'unknown')).replace('|', '')}` | "
-                     f"{entry.get('mode', '?')} | {size} |")
+                     f"{entry.get('role', '?')}/{entry.get('mode', '?')} | {size} |")
     if len(rows) > 15:
         lines.append(f"\n…and {len(rows)-15} more in `report.json` → `replay`.")
     if not rows:
         lines.append("| *(no newly generated stable Base witnesses)* | – | – | – |")
-    lines.extend(["", "To retain one, run the manual **Review PatchGuard regression for tracking** "
-                  "workflow with this run's ID and the generated case ID. The workflow proposes "
-                  "a PR; it does not automatically merge.", ""])
+    lines.extend(["", "The automatic Action stage verifies all candidates, filters already-present fixtures, "
+                  "and opens a single draft GitHub PR on trusted default-branch runs when write permissions are granted.", ""])
     (folder / "regression-candidates.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"Regression candidate index: {folder.relative_to(root) / 'regression-candidates.md'} ({len(rows)} candidates)")
 

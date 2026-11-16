@@ -104,7 +104,7 @@ def _tokens(
         for name in FIELD.findall(token):
             if name not in allowed:
                 raise ConfigError(f"{field}: unsupported placeholder {{{name}}}")
-            if name in {"sources", "flags"} and token != "{" + name + "}":
+            if name in {"sources", "flags", "case_args"} and token != "{" + name + "}":
                 raise ConfigError(f"{field}: {{{name}}} must be a complete argv element")
     return value
 
@@ -184,11 +184,8 @@ def _validate_run(run: dict) -> None:
     method = run["method"]
     if method not in ("stdin", "file", "argv"):
         raise ConfigError("run.method: expected stdin, file or argv")
-    args = _tokens(run.get("args", []), "run.args", ("input_file",) if method == "file" else ("input_arg",) if method == "argv" else (), empty=True)
-    if method == "file" and not any("{input_file}" in arg for arg in args):
-        raise ConfigError("run.args: file delivery requires {input_file}")
-    if method == "argv" and not any("{input_arg}" in arg for arg in args):
-        raise ConfigError("run.args: argv delivery requires {input_arg}")
+    args = run.get("args", [])
+    validate_case_args(args, method, "run.args", require_delivery=bool(args))
     timeout = run["timeout_seconds"]
     if type(timeout) not in (int, float) or timeout <= 0 or (type(timeout) is float and not math.isfinite(timeout)):
         raise ConfigError("run.timeout_seconds: expected a finite positive number")
@@ -203,6 +200,41 @@ def _validate_run(run: dict) -> None:
             raise ConfigError(f"run.env: {key} is locked")
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key) or not isinstance(value, str) or "\x00" in value:
             raise ConfigError(f"run.env: invalid variable name or value for {key!r}")
+
+
+def validate_case_args(args: object, method: str, field: str, *,
+                       require_delivery: bool = True) -> list[str]:
+    """Validate argv *elements*, not a shell command or a restrictive DSL.
+
+    CLI flags may legitimately contain spaces, quotes, JSON, pipes, and braces
+    (for example jq filter expressions). subprocess.Popen uses an argv list
+    without shell evaluation, so those are literal bytes, not executable code.
+    Only delivery placeholders have special meaning.
+    """
+    if not isinstance(args, list) or len(args) > 128:
+        raise ConfigError(f"{field}: expected an argv list with at most 128 elements")
+    for item in args:
+        if not isinstance(item, str) or "\x00" in item or len(item) > 8192:
+            raise ConfigError(f"{field}: argv elements must be strings without NUL (max 8192 characters)")
+        if method != "file" and "{input_file}" in item:
+            raise ConfigError(f"{field}: unsupported placeholder {{input_file}} for {method}")
+        if method != "argv" and "{input_arg}" in item:
+            raise ConfigError(f"{field}: unsupported placeholder {{input_arg}} for {method}")
+    if require_delivery and method in ("file", "argv"):
+        marker = "{input_file}" if method == "file" else "{input_arg}"
+        if not any(marker in item for item in args):
+            raise ConfigError(f"{field}: {method} delivery requires {marker}")
+    return args
+
+
+def oracle_argv(oracle: dict, args: list[str]) -> list[str]:
+    """Pass case-specific CLI flags to a trusted independent reference model.
+
+    The {case_args} placeholder expands as complete subprocess argv elements,
+    never via a shell. An oracle without the placeholder stays input-only.
+    """
+    return [value for token in oracle["command"]
+            for value in (args if token == "{case_args}" else [token])]
 
 
 def load_config(path: str | Path, patched: str | Path | None = None) -> dict:
@@ -242,7 +274,7 @@ def load_config(path: str | Path, patched: str | Path | None = None) -> dict:
     _within(corpus["path"], "corpus.path")
     if "oracle" in data:
         oracle = _mapping(data["oracle"], "oracle", "command", "timeout_seconds")
-        command = _tokens(oracle["command"], "oracle.command")
+        command = _tokens(oracle["command"], "oracle.command", ("case_args",))
         if "{" in command[0] or command[0].startswith("-") or "/" in command[0]:
             raise ConfigError("oracle.command: first element must be a tool name")
         timeout = oracle.get("timeout_seconds", 2)
@@ -252,14 +284,18 @@ def load_config(path: str | Path, patched: str | Path | None = None) -> dict:
     output_dir = _within(regression["dir"], "regression.dir")
     if not any(output_dir.is_relative_to(ROOT / folder) for folder in ("tests/regression/generated", "artifacts")):
         raise ConfigError("regression.dir: expected a directory under tests/regression/generated or artifacts")
-    if "reviewed" in regression:
-        reviewed = _within(regression["reviewed"], "regression.reviewed")
-        if not reviewed.is_relative_to(ROOT / "tests/regression/reviewed"):
-            raise ConfigError("regression.reviewed must be under tests/regression/reviewed")
+    if "reviewed" not in regression:
+        # Automatic PRs must work for existing configurations that only set
+        # regression.dir; use a stable, target-specific reviewed suite.
+        regression["reviewed"] = f"tests/regression/reviewed/{target['name']}"
+    reviewed = _within(regression["reviewed"], "regression.reviewed")
+    if not reviewed.is_relative_to(ROOT / "tests/regression/reviewed"):
+        raise ConfigError("regression.reviewed must be under tests/regression/reviewed")
     return data
 
 
-def load_cases(manifest: Path, limit: int, output_limit: int, *, optional: bool = False) -> list[dict]:
+def load_cases(manifest: Path, limit: int, output_limit: int, *, optional: bool = False,
+               run: dict | None = None) -> list[dict]:
     """Load byte-exact independent oracles relative to their fixture root."""
     if optional and not manifest.exists():
         return []
@@ -271,7 +307,7 @@ def load_cases(manifest: Path, limit: int, output_limit: int, *, optional: bool 
     ids = set()
     for value in data:
         row = _mapping(value, str(manifest), "id kind input expected_exit expected_stdout",
-                       "description preserved_signature input_sha256 witness_role witness_mode")
+                       "description preserved_signature input_sha256 witness_role witness_mode args")
         case_id = _identifier(row["id"], "case.id")
         if case_id in ids:
             raise ConfigError(f"{manifest}: duplicate case ID {case_id}")
@@ -281,7 +317,16 @@ def load_cases(manifest: Path, limit: int, output_limit: int, *, optional: bool 
         code = row["expected_exit"]
         if type(code) is not int or not 0 <= code <= 255:
             raise ConfigError(f"{case_id}: expected a normal exit code from 0 to 255")
+        if "args" in row:
+            # An explicit [] overrides global args for stdin cases.
+            if run is None:
+                raise ConfigError(f"{case_id}.args: run settings are required for validation")
+            validate_case_args(row["args"], run["method"], f"{case_id}.args")
+        elif run is not None:
+            validate_case_args(run.get("args", []), run["method"], f"{case_id}.effective_args")
         case = dict(row, manifest_path=manifest.relative_to(ROOT).as_posix())
+        if run is not None:
+            case["effective_args"] = list(row.get("args", run.get("args", [])))
         for field, maximum in (("input", limit), ("expected_stdout", output_limit)):
             relative = Path(_string(row[field], f"{case_id}.{field}"))
             if relative.is_absolute():

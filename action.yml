@@ -8,6 +8,14 @@ inputs:
     description: 'Optional candidate source path, relative to consumer repository root'
     required: false
     default: ''
+  auto-regression-pr:
+    description: 'Propose all unique stable minimized findings as one draft PR on trusted default-branch runs'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Write-capable token for the review PR (permissions: contents:write, pull-requests:write)'
+    required: false
+    default: ${{ github.token }}
   report-dir:
     description: 'Where to save summary.md, verdict.json and all evidence'
     required: false
@@ -29,4 +37,7 @@ runs:
         PG_CONFIG: ${{ inputs.config }}
         PG_PATCHED: ${{ inputs.patched }}
         PG_REPORT_DIR: ${{ inputs.report-dir }}
+        PG_AUTO_REGRESSION_PR: ${{ inputs.auto-regression-pr }}
+        PG_GITHUB_TOKEN: ${{ inputs.github-token }}
+        PG_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       run: "$GITHUB_ACTION_PATH/scripts/github_gate.sh"

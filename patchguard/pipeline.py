@@ -31,17 +31,17 @@ def evaluate(config_path: str, patched: str | None, directory: Path, report: dic
         limits = (settings["max_input_bytes"], settings["output_limit_bytes"])
         manifest = workspace_path(config["corpus"]["path"], "corpus.path")
         regression = workspace_path(config["regression"]["dir"], "regression.dir")
-        cases = load_cases(manifest, *limits)
-        local_cases = load_cases(regression / "manifest.yaml", *limits, optional=True)
+        cases = load_cases(manifest, *limits, run=settings)
+        local_cases = load_cases(regression / "manifest.yaml", *limits, optional=True, run=settings)
         if reviewed_path := config["regression"].get("reviewed"):
             reviewed = workspace_path(reviewed_path, "regression.reviewed")
-            reviewed_cases = load_cases(reviewed / "manifest.yaml", *limits, optional=True)
+            reviewed_cases = load_cases(reviewed / "manifest.yaml", *limits, optional=True, run=settings)
             by_id = {case["id"]: case for case in reviewed_cases}
             for case in local_cases:
                 if case["id"] not in by_id:
                     continue
                 fields = ("input", "expected_exit", "expected_stdout", "preserved_signature",
-                          "kind", "witness_role", "witness_mode")
+                          "kind", "witness_role", "witness_mode", "args")
                 if any(case.get(field) != by_id[case["id"]].get(field) for field in fields):
                     raise ConfigError(f"local and reviewed regression cases disagree: {case['id']}")
             cases.extend(reviewed_cases)
@@ -55,7 +55,8 @@ def evaluate(config_path: str, patched: str | None, directory: Path, report: dic
         known_oracles = {}
         for case in cases:
             expected = (case["expected_exit"], case["expected_stdout"])
-            if known_oracles.setdefault(case["input"], expected) != expected:
+            key = (case["input"], tuple(case.get("args", settings.get("args", []))))
+            if known_oracles.setdefault(key, expected) != expected:
                 raise ConfigError(f"conflicting independent oracles for {case['id']}")
         report["cases"] = [
             case | {key: case[key].hex() for key in ("input", "expected_stdout")} |

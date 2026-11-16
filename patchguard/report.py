@@ -52,7 +52,9 @@ def write_partial_report(
 
 def generate_case(directory: Path, case: dict, data: bytes, signature: str,
                   *, expected_exit: int | None = None, expected_stdout: bytes | None = None,
-                  witness_role: str | None = None, witness_mode: str | None = None) -> dict:
+                  witness_role: str | None = None, witness_mode: str | None = None,
+                  args: list[str] | None = None,
+                  identity_args: list[str] | None = None, case_id: str | None = None) -> dict:
     """Persist a deterministic regression observation without replacing manual fixtures."""
     from hashlib import sha256
     import fcntl
@@ -68,14 +70,22 @@ def generate_case(directory: Path, case: dict, data: bytes, signature: str,
     directory.mkdir(parents=True, exist_ok=True)
     manifest = workspace_path(directory / "manifest.yaml", "generated manifest", within=directory)
     digest = sha256(data).hexdigest()
-    case_id = f"generated-{digest[:12]}-{signature[:12]}"
+    generated_id = f"generated-{digest[:12]}-{signature[:12]}"
     if witness_role is not None and witness_mode is not None:
-        case_id += f"-{witness_role}-{witness_mode}"
+        generated_id += f"-{witness_role}-{witness_mode}"
+    if identity_args is not None:
+        # Same bytes and fault can arise under different CLI flags. They
+        # must not collide with one another or older global-args fixtures.
+        argv_digest = sha256(json.dumps(identity_args, ensure_ascii=True).encode()).hexdigest()[:10]
+        generated_id += f"-a{argv_digest}"
+    case_id = case_id or generated_id
     row = dict(id=case_id, kind=case["kind"], input=f"{digest[:12]}.bin",
                expected_exit=expected_exit, expected_stdout=f"{case_id}.out",
                preserved_signature=signature, input_sha256=digest)
     if witness_role is not None and witness_mode is not None:
         row.update(witness_role=witness_role, witness_mode=witness_mode)
+    if args is not None:
+        row["args"] = list(args)
     with workspace_path(directory / ".manifest.lock", "generated lock", within=directory).open("ab") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         rows = load_yaml(manifest) if manifest.exists() else []
@@ -168,6 +178,174 @@ def _short(items: list[str], limit: int = 6) -> str:
     return visible + (f" … (+{len(items) - limit} more)" if len(items) > limit else "")
 
 
+def _execution_state(row: dict) -> str:
+    diagnostic = row.get('diagnostic') or {}
+    if diagnostic:
+        return f"{diagnostic.get('mechanism', 'fault')}/{diagnostic.get('kind', 'unknown')}"
+    if row.get('state') not in (None, 'normal'):
+        return f"{row.get('state')}/{row.get('signal') or row.get('returncode')}"
+    if row.get('match') is False:
+        return f"mismatch/{row.get('mismatch_kind', '?')}"
+    return 'OK'
+
+
+def _clean_cell(value: object) -> str:
+    return str(value).replace('|', '/').replace('`', "'").replace('\n', ' ')
+
+
+def _detailed_sections(report: dict) -> list[str]:
+    """Show actionable human evidence and the exact internal ZIP paths."""
+    prefix = report['run']['directory']
+    lines = ['', '## Binary hardening · all four builds', '',
+             '| Build | NX | PIE | RELRO | Stack Canary | Exact evidence path INSIDE ZIP |',
+             '| --- | --- | --- | --- | --- | --- |']
+    info = report.get('binary_metadata') or {}
+    for role in ('base', 'candidate'):
+        for mode in ('release', 'checked'):
+            key = f'{role}-{mode}'
+            metadata = info.get(key) or {}
+            protections = metadata.get('hardening') or {}
+            values = [str((protections.get(name) or {}).get('status', 'not checked'))
+                      for name in ('nx', 'pie', 'relro', 'stack_canary')]
+            probe = ((metadata.get('tools') or {}).get('readelf') or {}).get('process') or {}
+            evidence = (probe.get('stdout') or {}).get('path', 'unavailable')
+            lines.append(f"| `{key}` | " + ' | '.join(values) + f' | `{evidence}` |')
+    base = (info.get('base-release') or {}).get('hardening') or {}
+    candidate = (info.get('candidate-release') or {}).get('hardening') or {}
+    if base and candidate:
+        lines.extend(['', '**Release Base → Candidate:** ' + '; '.join(
+            f"{name}: {base[name]['status']} → {candidate[name]['status']}"
+            for name in ('nx', 'pie', 'relro', 'stack_canary')) + '.'])
+        warnings = report.get('hardening_warnings') or []
+        lines.append('**' + ('⚠ Hardening downgrade: ' + '; '.join(
+            f"{row['protection']} ({row['before']['status']} → {row['after']['status']})"
+            for row in warnings) if warnings else 'No Release hardening downgrade observed.') + '**')
+    else:
+        lines.extend(['', '**⚠ Hardening comparison unavailable:** binary metadata was not completed.'])
+    runtime = report.get('runtime_findings') or []
+    observations = report.get('observations') or {}
+    categories = ('Fixed', 'Incomplete Fix', 'New Issue', 'Inconclusive')
+    lines.extend(['', '## Patch-to-finding correlation and independent contract states', '',
+                  '- **Runtime findings:** ' + ', '.join(
+                      f'{name}: {sum(row.get("status") == name for row in runtime)}' for name in categories) + '.',
+                  '- **Functional regression cases:** ' +
+                  str(len(observations.get('regressions') or [])) +
+                  '; **contract mismatches remaining:** ' + str(len(observations.get('remaining') or [])) +
+                  '; **new contract issues:** ' + str(len(observations.get('new_issues') or [])) + '.',
+                  '- The patch correlation can be `direct`, `indirect`, or `unknown`; it is '
+                  'supporting evidence, **not proof that the patch caused a fault**.', '',
+                  '| Case | Mode | Status | Changed-code relationship | Fault site |',
+                  '| --- | --- | --- | --- | --- |'])
+    for finding in runtime[:20]:
+        location = ((finding.get('after') or finding.get('before') or {}).get('location') or {})
+        site = f"{location.get('path')}:{location.get('line')}" if location else 'not symbolized'
+        lines.append(f"| `{_clean_cell(finding.get('case_id'))}` | `{finding.get('mode')}` | "
+                     f"{_clean_cell(finding.get('status', 'Inconclusive'))} | "
+                     f"`{(finding.get('correlation') or {}).get('label', 'unknown')}` | "
+                     f"`{_clean_cell(site)}` |")
+    if not runtime:
+        lines.append('| *(none observed)* | – | – | – | – |')
+    if len(runtime) > 20:
+        lines.append(f"{len(runtime)-20} more mappings in `{prefix}/report.json` → `runtime_findings`.")
+    lines.extend(['', '## All-case outcome at a glance', '',
+                  '| Test case | Base Release | Candidate Release | Base Checked | Candidate Checked |',
+                  '| --- | --- | --- | --- | --- |'])
+    all_records = report.get('executions') or []
+    grouped = {}
+    for row in all_records:
+        grouped.setdefault(row.get('case_id'), {})[(row.get('role'), row.get('mode'))] = row
+    for case_id, variants in sorted(grouped.items())[:20]:
+        states = [_clean_cell(_execution_state(variants[(role, mode)]))
+                  if (role, mode) in variants else 'not run'
+                  for role, mode in (('base', 'release'), ('candidate', 'release'),
+                                     ('base', 'checked'), ('candidate', 'checked'))]
+        lines.append(f"| `{_clean_cell(case_id)}` | " + ' | '.join(states) + ' |')
+    if not grouped:
+        lines.append('| *(no executions)* | – | – | – | – |')
+    if len(grouped) > 20:
+        lines.append(f'\n{len(grouped)-20} additional cases: `{prefix}/report.json` → `executions`.')
+    abnormal = [row for row in all_records if row.get('diagnostic')
+                or row.get('state') not in (None, 'normal') or row.get('match') is False]
+    lines.extend(['', f'## Crash details and readable stack traces ({len(abnormal)} abnormal runs)', ''])
+    if not abnormal:
+        lines.append('No unexpected exit, sanitizer finding or output mismatch was observed.')
+    for row in abnormal[:12]:
+        diagnostic = row.get('diagnostic') or {}
+        stdout = (row.get('stdout') or {}).get('path', 'unavailable')
+        stderr = (row.get('stderr') or {}).get('path', 'unavailable')
+        record = row.get('record', 'unavailable')
+        lines.extend(['', f"### `{_clean_cell(row.get('case_id'))}` · {row.get('role')}/{row.get('mode')}", '',
+                      f"- **Error type / detection:** `{_clean_cell(_execution_state(row))}` / "
+                      f"`{diagnostic.get('mechanism', 'process/contract')}`.",
+                      f"- **Termination:** `{row.get('state')}`; exit code `{row.get('returncode')}`; "
+                      f"signal `{row.get('signal') or 'none'}`; timeout `{row.get('timed_out', False)}`.",
+                      f'- **Inside ZIP:** execution `{record}`, stderr `{stderr}`, stdout `{stdout}`.'])
+        location = diagnostic.get('location') or {}
+        if location:
+            lines.append(f"- **Reported site:** `{_clean_cell(location.get('path'))}:{location.get('line', '?')}`.")
+        frames = diagnostic.get('frames') or []
+        if frames:
+            lines.extend(['- **Stack trace (top frame first):**', '', '```text'])
+            for index, frame in enumerate(frames[:8]):
+                function = str(frame.get('function', '?')).replace('```', "''")[:160]
+                path = str(frame.get('path', '?')).replace('```', "''")[:200]
+                lines.append(f"#{index} {function}  —  {path}:{frame.get('line', '?')}")
+            lines.extend(['```', ''])
+            if len(frames) > 8:
+                lines.append(f"{len(frames)-8} further frames: inspect the exact stderr file above.")
+        elif diagnostic or row.get('state') not in (None, 'normal'):
+            lines.append('- **Stack trace:** unavailable in recorded stderr; see stderr above. '
+                         'No invented backtrace is shown.')
+        else:
+            lines.append('- **Stack trace:** not applicable (independent functional oracle mismatch).')
+        finding = next((item for item in report.get('runtime_findings', [])
+                        if item.get('case_id') == row.get('case_id') and item.get('mode') == row.get('mode')), None)
+        if finding:
+            lines.append(f"- **Patch association:** `{(finding.get('correlation') or {}).get('label', 'unknown')}`; "
+                         f"full evidence: `{prefix}/report.json` → `runtime_findings`.")
+    if len(abnormal) > 12:
+        lines.append(f"{len(abnormal)-12} more abnormal runs: `{prefix}/report.json` → `executions` "
+                     '(each item contains exact `record` and stderr paths).')
+    bundles = report.get('replay') or []
+    lines.extend(['', '## Three-attempt reproducers and minimized tests', '',
+                  '| Case | Witness | Stable after 3 repeats? | Bundle manifest INSIDE ZIP | Minimized input INSIDE ZIP |',
+                  '| --- | --- | --- | --- | --- |'])
+    for bundle in bundles[:20]:
+        lines.append(f"| `{_clean_cell(bundle.get('case_id'))}` | "
+                     f"`{bundle.get('role')}/{bundle.get('mode')}` | "
+                     f"{'yes' if bundle.get('stable') else 'NO / flaky'} | "
+                     f"`{bundle.get('path')}` | `{bundle.get('minimized', 'unavailable')}` |")
+    if not bundles:
+        lines.append('| *(none)* | – | – | – | – |')
+    if len(bundles) > 20:
+        lines.append(f"{len(bundles)-20} additional reproducers: `{prefix}/report.json` → `replay`.")
+    resolved = (report.get('config') or {}).get('resolved') or {}
+    regression = resolved.get('regression') or {}
+    lines.extend(['', '## Exact layout of `technical-evidence.zip`', '',
+                  f'- **ZIP saved by Action:** `{prefix}/technical-evidence.zip`.',
+                  f'- **Full structured verdict:** `{prefix}/report.json` (INSIDE ZIP).',
+                  f'- **Source patch:** `{prefix}/diff/source.patch` (INSIDE ZIP).',
+                  f'- **Runs:** `{prefix}/runs/<base|candidate>/<release|checked>/<case-id>/result.json` '
+                  'with neighboring `stdout.bin` and `stderr.bin` (INSIDE ZIP).',
+                  f'- **Replay bundles:** `{prefix}/cases/<signature>-<role>-<mode>-<case-id>/manifest.json` '
+                  '(INSIDE ZIP); each manifest gives `history` (three precise attempts), '
+                  '`original`, `minimized`, toolchain, binary SHA-256 and runtime environment.',
+                  f'- **Minimizer decision log:** `{prefix}/cases/<signature>-<role>-<mode>-<case-id>/'
+                  'minimization-trace.json` (when minimization was performed).',
+                  f'- **ELF hardening proofs:** `{prefix}/binary-info/<build-name>/readelf/stdout.bin` '
+                  'and `symbols/stdout.bin` (INSIDE ZIP).',
+                  f'- **Build commands and metadata:** `{prefix}/report.json` → `builds`; '
+                  f'compiler logs: `{prefix}/builds/` (INSIDE ZIP).',
+                  f'- **Patch-to-finding mapping:** `{prefix}/report.json` → `runtime_findings` and `correlation`.',
+                  f'- **New generated fixture manifest:** `{regression.get("dir", "not configured")}/manifest.yaml` '
+                  '(INSIDE ZIP, if generated).',
+                  f'- **After PR approval, tracked regression suite:** '
+                  f'`{regression.get("reviewed", "not configured")}/manifest.yaml`.',
+                  '', '**Important:** paths above are ZIP member names relative to the repository root. '
+                  '`summary.md` is intentionally published outside the ZIP in the Action artifact.'])
+    return lines
+
+
 def _summary(report: dict) -> str:
     """One-screen CI report; raw logs are NEVER expanded in this file."""
     verdict = _verdict(report)
@@ -245,6 +423,7 @@ def _summary(report: dict) -> str:
     if warnings:
         lines.extend(["", "## Hardening warnings", ""])
         lines.extend(f"- {item['protection']}: {item['before']['status']} → {item['after']['status']}" for item in warnings[:6])
+    lines.extend(_detailed_sections(report))
     lines.extend(["", "## Where to look", "", "- [Evidence guide](evidence-index.md) — which folder contains each kind of log",
                   "- [Compact machine verdict](verdict.json) · [Complete analysis](report.json)",
                   "- `runs/` — executed commands, stdout/stderr and process records",

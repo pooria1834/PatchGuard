@@ -17,7 +17,7 @@ import yaml
 
 from .analyze import compare, signature
 from .build import build_variant
-from .config import ROOT, ConfigError, UniqueKeyLoader, load_config, workspace_path
+from .config import ROOT, ConfigError, UniqueKeyLoader, load_cases, load_config, oracle_argv, validate_case_args, workspace_path
 from .report import generate_case
 from .run import ENV, run_case
 from .source import inventory, tree_digest
@@ -94,16 +94,27 @@ def inspect_archive(archive: Path, config: dict, case_id: str) -> tuple[dict, di
         row = matches[0]
         required = {"id", "kind", "input", "expected_exit", "expected_stdout",
                     "input_sha256", "preserved_signature", "witness_role", "witness_mode"}
-        if set(row) != required or row["witness_role"] != "base":
-            raise ConfigError("only fully specified Base witnesses are promotable")
+        if not required <= set(row) or set(row) - required - {"args"}:
+            raise ConfigError("generated witness has unknown or missing fields")
+        if row["witness_role"] not in ("base", "candidate"):
+            raise ConfigError("witness_role must be base or candidate")
+        args = validate_case_args(row.get("args", config["run"].get("args", [])),
+                                  config["run"]["method"], "generated.args")
         if row["kind"] not in ("valid", "invalid", "boundary", "regression"):
             raise ConfigError("invalid generated case kind")
         if row["witness_mode"] not in ("release", "checked"):
             raise ConfigError("invalid witness mode")
         if not HEX64.fullmatch(str(row["input_sha256"])) or not HEX64.fullmatch(str(row["preserved_signature"])):
             raise ConfigError("invalid witness hashes")
-        if not re.fullmatch(r"generated-[0-9a-f]{12}-[0-9a-f]{12}-base-(?:release|checked)", case_id):
+        if not re.fullmatch(r"generated-[0-9a-f]{12}-[0-9a-f]{12}-(?:base|candidate)-(?:release|checked)(?:-a[0-9a-f]{10})?", case_id):
             raise ConfigError("malformed generated case ID")
+        prefix = f"generated-{row['input_sha256'][:12]}-{row['preserved_signature'][:12]}-"
+        if not case_id.startswith(prefix):
+            raise ConfigError("generated case ID disagrees with the archived input/fault hash")
+        if '-a' in case_id:
+            argv_hash = sha256(json.dumps(args, ensure_ascii=True).encode()).hexdigest()[:10]
+            if not case_id.endswith(f'-a{argv_hash}') or 'args' not in row:
+                raise ConfigError("generated case ID disagrees with the archived argv")
         if row["input"] != f"{row['input_sha256'][:12]}.bin" or row["expected_stdout"] != f"{case_id}.out":
             raise ConfigError("noncanonical generated fixture filenames")
         data = _bytes(zf, entries, f"{generated_dir}/{row['input']}")
@@ -115,10 +126,10 @@ def inspect_archive(archive: Path, config: dict, case_id: str) -> tuple[dict, di
             raise ConfigError("generated fixture hash, bounds or expected exit mismatch")
         matches = [b for b in report.get("replay", []) if isinstance(b, dict)
                    and b.get("generated", {}).get("id") == case_id
-                   and b.get("role") == "base" and b.get("mode") == row["witness_mode"]
+                   and b.get("role") == row["witness_role"] and b.get("mode") == row["witness_mode"]
                    and b.get("generated", {}).get("manifest") == manifest_name]
         if not matches or not any(b.get("stable") for b in matches):
-            raise ConfigError("no stable Base replay evidence for selected case")
+            raise ConfigError("no stable witness replay evidence for selected case")
         for bundle in matches:
             if not bundle.get("stable"):
                 continue
@@ -127,6 +138,7 @@ def inspect_archive(archive: Path, config: dict, case_id: str) -> tuple[dict, di
                 or bundle.get("minimized_sha256") != row["input_sha256"]
                 or bundle.get("minimized_expected_exit") != row["expected_exit"]
                 or bundle.get("minimized_expected_stdout") != expected.hex()
+                or bundle.get("args", config["run"].get("args", [])) != args
                 or not isinstance(history, list) or len(history) != 3
                 or any(not isinstance(a, dict) or a.get("signature") != bundle["signature"] for a in history)):
                 continue
@@ -143,11 +155,13 @@ def inspect_archive(archive: Path, config: dict, case_id: str) -> tuple[dict, di
             if verified:
                 return (dict(id=case_id, kind=row["kind"], input=data,
                              expected_exit=row["expected_exit"], expected_stdout=expected,
-                             witness_role="base", witness_mode=row["witness_mode"],
-                             preserved_signature=row["preserved_signature"]),
+                             witness_role=row["witness_role"], witness_mode=row["witness_mode"],
+                             preserved_signature=row["preserved_signature"],
+                             **({"args": args} if "args" in row else {})),
                         dict(run_id=report["run"]["id"], base_revision=report.get("sources", {}).get("base", {}).get("revision"),
-                             source_digest=report.get("sources", {}).get("base", {}).get("digest"),
-                             history_count=3, minimized_sha256=sha256(data).hexdigest()))
+                             source_digest=report.get("sources", {}).get(row["witness_role"], {}).get("digest"),
+                             history_count=3, minimized_sha256=sha256(data).hexdigest(),
+                             args_explicit="args" in row))
         raise ConfigError("three replay records or minimized fixture do not match the evidence")
 
 
@@ -155,9 +169,21 @@ def check_independent_oracle(config: dict, case: dict) -> None:
     """Run the trusted independent oracle, not the patched binary."""
     oracle = config.get("oracle")
     if not oracle:
-        raise ConfigError("promotion requires a configured independent oracle")
+        # A byte-exact, independently reviewed fixture is also an independent
+        # oracle; a newly shortened, unknown input is NOT.
+        corpus = workspace_path(config["corpus"]["path"], "corpus.path")
+        run = config["run"]
+        reference_cases = load_cases(corpus, run["max_input_bytes"],
+                                     run["output_limit_bytes"], run=run)
+        expected_args = case.get("args", run.get("args", []))
+        if any(row["input"] == case["input"] and row["expected_exit"] == case["expected_exit"]
+               and row["expected_stdout"] == case["expected_stdout"]
+               and row.get("args", run.get("args", [])) == expected_args for row in reference_cases):
+            return
+        raise ConfigError("promotion requires an independent oracle for a new minimized input")
     try:
-        result = subprocess.run(oracle["command"], input=case["input"], cwd=ROOT,
+        result = subprocess.run(oracle_argv(oracle, case.get("args", config["run"].get("args", []))),
+                                input=case["input"], cwd=ROOT,
                                 env=ENV, capture_output=True,
                                 timeout=oracle.get("timeout_seconds", 2), check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -168,23 +194,24 @@ def check_independent_oracle(config: dict, case: dict) -> None:
 
 
 def check_base_replay(config: dict, case: dict, metadata: dict, *, expected_digest: str | None = None) -> None:
-    """Build trusted Base and independently repeat the selected fault three times."""
-    base = workspace_path(config["sources"]["base"], "sources.base")
+    """Build the archived witness variant and repeat its exact fault three times."""
+    role = case["witness_role"]
+    base = workspace_path(config["sources"]["base" if role == "base" else "patched"], "witness source")
     if not expected_digest or not HEX64.fullmatch(str(expected_digest)):
-        raise ConfigError("CI evidence has no valid Base source digest")
+        raise ConfigError("CI evidence has no valid witness source digest")
     digest = tree_digest(inventory(base))
     if expected_digest and digest != expected_digest:
-        raise ConfigError("current Base source tree differs from archived run; re-create the reported Base revision")
+        raise ConfigError("current witness source differs from archived run")
     work = workspace_path(Path("artifacts/promotion-check") / case["id"], "promotion check")
     work.mkdir(parents=True, exist_ok=True)
-    build = build_variant(config["build"], base, "base", case["witness_mode"], work, digest)
+    build = build_variant(config["build"], base, role, case["witness_mode"], work, digest)
     if build.get("error"):
-        raise ConfigError(f"Base cannot be built: {build['error']}")
+        raise ConfigError(f"Witness cannot be built: {build['error']}")
     for count in range(1, 4):
         result = run_case(build, case, config["run"], work / f"attempt-{count}")
         record = result | compare(case, result)
         if signature(record) != case["preserved_signature"]:
-            raise ConfigError(f"Base replay {count}/3 did not preserve the archived fault signature")
+            raise ConfigError(f"{role} replay {count}/3 did not preserve the archived fault signature")
 
 
 def promote_archive(config_path: str, archive_path: str, case_id: str, *, verify_base: bool = True,
@@ -203,7 +230,8 @@ def promote_archive(config_path: str, archive_path: str, case_id: str, *, verify
     destination = workspace_path(config["regression"]["reviewed"], "regression.reviewed")
     result = generate_case(destination, case, case["input"], case["preserved_signature"],
                            expected_exit=case["expected_exit"], expected_stdout=case["expected_stdout"],
-                           witness_role=case["witness_role"], witness_mode=case["witness_mode"])
+                           witness_role=case["witness_role"], witness_mode=case["witness_mode"],
+                           args=case.get("args"), case_id=case_id)
     if result["id"] != case_id:
         raise ConfigError("generated case ID differs from imported case")
     return result | metadata

@@ -17,6 +17,43 @@ from .run import execute, run_case
 from .source import inventory, source_diff, tree_digest
 
 
+def assess_registered_regressions(cases: list[dict], executions: list[dict]) -> tuple[list[dict], bool]:
+    """Accept a historical witness either when it still reproduces or is now clean.
+
+    A regression retained from an older version may already be fixed in the
+    current Base.  In that case *both* versions must pass its independent
+    oracle in release and checked builds; a changed fault is not a resolution.
+    """
+    indexed = {(row["case_id"], row["role"], row["mode"]): row for row in executions}
+    results = []
+    for case in cases:
+        if "preserved_signature" not in case:
+            continue
+        role, mode = case.get("witness_role"), case.get("witness_mode")
+        if role and mode:
+            witnesses = [indexed.get((case["id"], role, mode))]
+        else:
+            witnesses = [indexed.get((case["id"], r, m))
+                         for r in ("base", "candidate") for m in ("release", "checked")]
+        if any(row and signature(row) == case["preserved_signature"] for row in witnesses):
+            status = "reproduced"
+        else:
+            # Absence of the old crash alone is not enough: reject timeouts,
+            # different crashes, truncated output and incorrect behavior.
+            current = [indexed.get((case["id"], r, m))
+                       for r in ("base", "candidate") for m in ("release", "checked")]
+            status = "resolved" if all(
+                row is not None and row["state"] == "normal" and row["match"] is True
+                and row.get("diagnostic") is None
+                and not row["stdout"]["truncated"] and not row["stderr"]["truncated"]
+                for row in current
+            ) else "changed"
+        results.append(dict(case_id=case["id"], witness_role=role,
+                            witness_mode=mode, status=status))
+    return results, all(row["status"] in ("reproduced", "resolved")
+                        for row in results if row["witness_role"] == "base")
+
+
 def evaluate(config_path: str, patched: str | None, directory: Path, report: dict) -> tuple[int, str]:
     """Build and run configured cases, updating report evidence in order."""
     stage = "configuration"
@@ -165,23 +202,8 @@ def evaluate(config_path: str, patched: str | None, directory: Path, report: dic
             (finding["case_id"], finding["mode"], "candidate") in stable_sites
             for finding in report["runtime_findings"]
         )
-        signatures = {}
-        for row in report["executions"]:
-            signatures.setdefault(row["case_id"], {}).setdefault((row["role"], row["mode"]), set()).add(signature(row))
-        report["generated_observations"] = []
-        for case in cases:
-            if "preserved_signature" not in case:
-                continue
-            role, mode = case.get("witness_role"), case.get("witness_mode")
-            observed = (signatures[case["id"]].get((role, mode), set()) if role and mode
-                        else set().union(*signatures[case["id"]].values()))
-            report["generated_observations"].append(dict(
-                case_id=case["id"], witness_role=role, witness_mode=mode,
-                status="reproduced" if case["preserved_signature"] in observed else "changed"
-            ))
-        retained_base_witnesses = all(
-            row["status"] == "reproduced" for row in report["generated_observations"]
-            if row["witness_role"] == "base"
+        report["generated_observations"], retained_base_witnesses = assess_registered_regressions(
+            cases, report["executions"]
         )
         report["stages"].append(dict(name=stage, status="passed" if stable else "incomplete"))
         stage = "binary_metadata"
